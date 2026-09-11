@@ -59,6 +59,30 @@ final class OctriTests: XCTestCase {
         XCTAssertNil(trace.parentSpanId)
     }
 
+    func testReplacesAnOversizedEventId() throws {
+        let received = expectation(description: "event request")
+        XCTAssertTrue(URLProtocol.registerClass(StubURLProtocol.self))
+        defer {
+            StubURLProtocol.handler = nil
+            URLProtocol.unregisterClass(StubURLProtocol.self)
+        }
+        StubURLProtocol.handler = { request in
+            let key = request.value(forHTTPHeaderField: "idempotency-key")
+            XCTAssertTrue(key?.range(of: #"^[0-9a-f]{32}$"#, options: .regularExpression) != nil)
+            received.fulfill()
+        }
+
+        Octri.initialize(.init(
+            url: "https://monitoring.example.com/",
+            token: "project-token",
+            environment: "project-1"
+        ))
+        Octri.captureEvent("checkout.completed", options: .init(
+            eventId: String(repeating: "e", count: 257)
+        ))
+        wait(for: [received], timeout: 3)
+    }
+
     func testCaptureEventScopesAuthAndReplacesUnsafeIdempotencyKey() throws {
         let received = expectation(description: "event request")
         XCTAssertTrue(URLProtocol.registerClass(StubURLProtocol.self))

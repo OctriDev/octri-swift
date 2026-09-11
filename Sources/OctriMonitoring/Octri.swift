@@ -147,6 +147,7 @@ public struct OctriSpan {
 
 /// Standalone Octri monitoring. All reporting is asynchronous and best-effort.
 public enum Octri {
+    private static let maxIdempotencyKeyLength = 256
     private static let lock = NSLock()
     private static var config: OctriConfig?
 
@@ -154,6 +155,201 @@ public enum Octri {
         lock.lock()
         config = value
         lock.unlock()
+    }
+
+    // ── Scrubbing ──────────────────────────────────────────────────────────
+
+    /// Keys whose value never leaves the process. Compared against the key with
+    /// case and separators removed, so `api_key`, `apiKey` and `API-KEY` all
+    /// match `apikey`, and the test is a substring one, so `stripeSecretKey`
+    /// matches too.
+    private static let scrubKeys = [
+        "password", "passwd", "passphrase", "secret", "token", "apikey",
+        "authorization", "credential", "cookie", "session", "privatekey",
+        "accesskey", "cardnumber", "creditcard", "cvv", "ssn"
+    ]
+
+    private static let redacted = "[redacted]"
+    private static let truncated = "[truncated]"
+    /// Deep enough for real context dictionaries, shallow enough to stay cheap.
+    private static let maxScrubDepth = 8
+
+    private static let bearerExpression =
+        expression("\\bbearer\\s+[\\w.~+/-]+=*", caseInsensitive: true)
+    private static let jwtExpression = expression("\\beyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+")
+    private static let digitRunExpression = expression("\\b(?:\\d[ -]?){12,18}\\d\\b")
+    private static let emailExpression = expression("[\\w.%+-]+@[\\w-]+(?:\\.[\\w-]+)+")
+
+    private static var extraScrubKeys: [String] = []
+    private static var beforeSend: (([String: Any]) -> [String: Any]?)?
+
+    /// Redacts more key names, on top of the built-in list. Matching ignores
+    /// case and separators and is a substring test, so `account` also covers
+    /// `accountNumber`.
+    ///
+    ///     Octri.addScrubFields("accountNumber", "otp")
+    public static func addScrubFields(_ fields: String...) {
+        lock.lock()
+        defer { lock.unlock() }
+        for field in fields {
+            let key = normalizeKey(field)
+            if !key.isEmpty, !extraScrubKeys.contains(key) {
+                extraScrubKeys.append(key)
+            }
+        }
+    }
+
+    /// Runs a hook on every payload just before it is sent. Return the payload
+    /// to send it, or `nil` to drop the event:
+    ///
+    ///     Octri.setBeforeSend { payload in
+    ///         payload["path"] as? String == "/health" ? nil : payload
+    ///     }
+    ///
+    /// Redaction still runs afterwards, so a hook cannot leak a credential by
+    /// accident. Pass `nil` to remove the hook.
+    public static func setBeforeSend(_ hook: (([String: Any]) -> [String: Any]?)?) {
+        lock.lock()
+        beforeSend = hook
+        lock.unlock()
+    }
+
+    private static func expression(
+        _ pattern: String,
+        caseInsensitive: Bool = false
+    ) -> NSRegularExpression? {
+        try? NSRegularExpression(
+            pattern: pattern,
+            options: caseInsensitive ? [.caseInsensitive] : []
+        )
+    }
+
+    private static func normalizeKey(_ key: String) -> String {
+        String(key.lowercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) })
+    }
+
+    private static func isSecretKey(_ key: String, extra: [String]) -> Bool {
+        let normalized = normalizeKey(key)
+        guard !normalized.isEmpty else { return false }
+        return scrubKeys.contains(where: normalized.contains)
+            || extra.contains(where: normalized.contains)
+    }
+
+    /// Tells a card number from the order ids and timestamps that look like one.
+    private static func passesLuhn(_ digits: String) -> Bool {
+        var sum = 0
+        var doubling = false
+        for character in digits.reversed() {
+            guard let value = character.wholeNumberValue else { return false }
+            var digit = value
+            if doubling {
+                digit *= 2
+                if digit > 9 { digit -= 9 }
+            }
+            sum += digit
+            doubling = !doubling
+        }
+        return sum % 10 == 0
+    }
+
+    private static func replacingMatches(
+        _ value: String,
+        _ expression: NSRegularExpression?
+    ) -> String {
+        guard let expression else { return value }
+        let range = NSRange(location: 0, length: (value as NSString).length)
+        return expression.stringByReplacingMatches(
+            in: value,
+            range: range,
+            withTemplate: redacted
+        )
+    }
+
+    /// Digit runs are only redacted when they also pass the Luhn check, so an
+    /// order number or a timestamp survives.
+    private static func replacingCardNumbers(_ value: String) -> String {
+        guard let expression = digitRunExpression else { return value }
+        let source = value as NSString
+        var result = value
+        let matches = expression.matches(
+            in: value,
+            range: NSRange(location: 0, length: source.length)
+        )
+        // Back to front, so the ranges found in `value` still line up.
+        for match in matches.reversed() {
+            let run = source.substring(with: match.range)
+            let digits = String(run.filter { $0.isASCII && $0.isNumber })
+            guard passesLuhn(digits) else { continue }
+            result = (result as NSString).replacingCharacters(
+                in: match.range,
+                with: redacted
+            )
+        }
+        return result
+    }
+
+    /// Removes credentials and personal data that leaked into free text.
+    private static func scrubText(_ value: String) -> String {
+        guard !value.isEmpty else { return value }
+        var scrubbed = replacingMatches(value, bearerExpression)
+        scrubbed = replacingMatches(scrubbed, jwtExpression)
+        scrubbed = replacingCardNumbers(scrubbed)
+        return replacingMatches(scrubbed, emailExpression)
+    }
+
+    /// Redacts credential-shaped keys anywhere in the payload, and strips
+    /// secrets out of the free text around them. `user` is the field you
+    /// deliberately fill with an identity, so its strings are left alone; its
+    /// keys are still checked.
+    private static func scrubValue(
+        _ value: Any,
+        depth: Int,
+        text: Bool,
+        extra: [String]
+    ) -> Any {
+        if let string = value as? String {
+            return text ? scrubText(string) : string
+        }
+        if let dictionary = value as? [String: Any] {
+            guard depth < maxScrubDepth else { return truncated }
+            var out: [String: Any] = [:]
+            out.reserveCapacity(dictionary.count)
+            for (key, nested) in dictionary {
+                out[key] = isSecretKey(key, extra: extra)
+                    ? redacted
+                    : scrubValue(
+                        nested,
+                        depth: depth + 1,
+                        text: text && key != "user",
+                        extra: extra
+                    )
+            }
+            return out
+        }
+        if let array = value as? [Any] {
+            guard depth < maxScrubDepth else { return truncated }
+            return array.map {
+                scrubValue($0, depth: depth + 1, text: text, extra: extra)
+            }
+        }
+        return value
+    }
+
+    /// The last thing every payload passes through. Both the hook and the
+    /// redaction live here rather than in the capture functions, so nothing can
+    /// be reported around them.
+    private static func scrubPayload(_ payload: [String: Any]) -> [String: Any]? {
+        lock.lock()
+        let hook = beforeSend
+        let extra = extraScrubKeys
+        lock.unlock()
+
+        var hooked = payload
+        if let hook {
+            guard let result = hook(payload) else { return nil }
+            hooked = result
+        }
+        return scrubValue(hooked, depth: 0, text: true, extra: extra) as? [String: Any]
     }
 
     public static func traceFromHeader(_ traceparent: String?) -> OctriTraceContext {
@@ -178,7 +374,7 @@ public enum Octri {
     /// Log an event without depending on a generated Octri API SDK.
     public static func captureEvent(_ message: String, options: OctriEventOptions = .init()) {
         guard let config = currentConfig() else { return }
-        let eventId = options.eventId.flatMap { safeHeaderValue($0) ? $0 : nil }
+        let eventId = options.eventId.flatMap { safeIdempotencyKey($0) ? $0 : nil }
             ?? randomHex(bytes: 16)
         var tags: [String: Any] = ["octri.origin": "standalone"]
         options.tags?.forEach { tags[$0.key] = $0.value }
@@ -269,11 +465,12 @@ public enum Octri {
         payload: [String: Any],
         idempotencyKey: String
     ) {
-        guard safeHeaderValue(idempotencyKey),
+        guard safeIdempotencyKey(idempotencyKey),
               config.token.map({ $0.isEmpty || safeHeaderValue($0) }) ?? true else { return }
-        guard JSONSerialization.isValidJSONObject(payload),
+        guard let scrubbed = scrubPayload(payload) else { return }
+        guard JSONSerialization.isValidJSONObject(scrubbed),
               let url = URL(string: config.url + path),
-              let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+              let body = try? JSONSerialization.data(withJSONObject: scrubbed) else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         request.httpMethod = "POST"
@@ -302,6 +499,12 @@ public enum Octri {
 
     private static func allZeros(_ value: Substring) -> Bool {
         value.allSatisfy { $0 == "0" }
+    }
+
+    /// A caller-supplied event id becomes the `idempotency-key` header, so it
+    /// is bounded as well as newline-free.
+    private static func safeIdempotencyKey(_ value: String) -> Bool {
+        safeHeaderValue(value) && value.utf8.count <= maxIdempotencyKeyLength
     }
 
     private static func safeHeaderValue(_ value: String) -> Bool {
