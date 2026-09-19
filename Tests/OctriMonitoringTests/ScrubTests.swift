@@ -167,19 +167,31 @@ final class ScrubTests: XCTestCase {
 
     // ── The user field ──────────────────────────────────────────────────────
 
-    func testUserIdentitySurvivesButUserCredentialsDoNot() throws {
+    // The identity the dashboard keys on is "id", which survives. Direct
+    // identifiers under the user are redacted like they are in every generated SDK.
+    func testUserIdSurvivesButUserCredentialsAndIdentifiersDoNot() throws {
         let payload = try capture {
             Octri.captureEvent("profile update failed", options: .init(user: [
                 "id": "u_1",
                 "email": "ada@example.com",
-                "sessionToken": "st_1"
+                "sessionToken": "st_1",
+                "customerPhone": "+1 555 0100"
+            ], context: [
+                "billingAddress": "1 High St",
+                "avatarUrl": "https://cdn.example.com/a.png",
+                "queryTimeMs": 12
             ]))
         }
 
         let user = try XCTUnwrap(payload["user"] as? [String: Any])
-        XCTAssertEqual(user["email"] as? String, "ada@example.com")
         XCTAssertEqual(user["id"] as? String, "u_1")
+        XCTAssertEqual(user["email"] as? String, "[redacted]")
         XCTAssertEqual(user["sessionToken"] as? String, "[redacted]")
+        XCTAssertEqual(user["customerPhone"] as? String, "[redacted]")
+        let context = try XCTUnwrap(payload["context"] as? [String: Any])
+        XCTAssertEqual(context["billingAddress"] as? String, "[redacted]")
+        XCTAssertEqual(context["avatarUrl"] as? String, "https://cdn.example.com/a.png")
+        XCTAssertEqual(context["queryTimeMs"] as? Int, 12)
     }
 
     // ── setBeforeSend ───────────────────────────────────────────────────────

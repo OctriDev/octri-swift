@@ -166,7 +166,14 @@ public enum Octri {
     private static let scrubKeys = [
         "password", "passwd", "passphrase", "secret", "token", "apikey",
         "authorization", "credential", "cookie", "session", "privatekey",
-        "accesskey", "cardnumber", "creditcard", "cvv", "ssn"
+        "accesskey", "cardnumber", "creditcard", "cvv", "ssn",
+        // Direct identifiers, matched the same way: "phone" also covers
+        // "phoneNumber" and "customerPhone", "address" covers "ipAddress" and
+        // "billingAddress". Bare "ip", "url" and "name" are deliberately absent:
+        // as substrings they would take "zip", "curl" and the error name with them.
+        "email", "phone", "address", "firstname", "lastname", "fullname", "username",
+        "useragent", "passport", "taxid", "nationalid", "dateofbirth", "birthdate", "birthday",
+        "postalcode", "zipcode", "latitude", "longitude", "socialsecurity", "ipaddress"
     ]
 
     private static let redacted = "[redacted]"
